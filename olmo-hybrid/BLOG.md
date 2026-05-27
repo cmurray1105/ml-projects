@@ -1,4 +1,4 @@
-# I LoRA Fine-Tuned a Hybrid Transformer/RNN Nobody Has Fine-Tuned Before. Here's What Broke.
+# I LoRA Fine-Tuned a Hybrid Transformer/RNN Nobody Has Fine-Tuned Before. Here's How I did it.
 
 *OLMo Hybrid 7B is a brand-new architecture combining two fundamentally different memory mechanisms in one model. There was no MLX port. No LoRA fine-tuning recipe. No QLoRA reference implementation. Just 36GB of unified memory, a lot of OOM errors, and a debugging journey that turned out to be surprisingly interesting.*
 
