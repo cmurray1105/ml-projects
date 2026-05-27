@@ -1,0 +1,33 @@
+# Model weights (large binaries — download via convert.py)
+weights/
+*.npz
+*.safetensors
+
+# LoRA checkpoints
+lora-*/
+lora_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Claude working memory (local only)
+CLAUDE.md
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Temp
+*.tmp
+*.log
