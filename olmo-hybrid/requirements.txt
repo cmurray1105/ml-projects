@@ -4,3 +4,5 @@ huggingface_hub
 safetensors
 numpy
 ml_dtypes
+datasets
+jinja2
