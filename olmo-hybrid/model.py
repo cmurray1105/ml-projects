@@ -132,13 +132,17 @@ class KVCache:
             new_k = mx.zeros((B, H, capacity, D), dtype=keys.dtype)
             new_v = mx.zeros((B, H, capacity, D), dtype=values.dtype)
             if self.keys is not None:
-                new_k = new_k.at[:, :, :prev, :].set(self.keys[:, :, :prev, :])
-                new_v = new_v.at[:, :, :prev, :].set(self.values[:, :, :prev, :])
+                new_k = mx.concatenate([self.keys[:, :, :prev, :],
+                                        mx.zeros((B, H, capacity - prev, D), dtype=keys.dtype)], axis=2)
+                new_v = mx.concatenate([self.values[:, :, :prev, :],
+                                        mx.zeros((B, H, capacity - prev, D), dtype=values.dtype)], axis=2)
             self.keys   = new_k
             self.values = new_v
 
-        self.keys   = self.keys.at[:, :, prev:new_offset, :].set(keys)
-        self.values = self.values.at[:, :, prev:new_offset, :].set(values)
+        self.keys   = mx.concatenate([self.keys[:, :, :prev, :], keys,
+                                      self.keys[:, :, new_offset:, :]], axis=2)
+        self.values = mx.concatenate([self.values[:, :, :prev, :], values,
+                                      self.values[:, :, new_offset:, :]], axis=2)
         self._offset = new_offset
         return self.keys[:, :, :new_offset, :], self.values[:, :, :new_offset, :]
 
@@ -192,6 +196,58 @@ class ShortConv(nn.Module):
         x_pad = mx.concatenate([pad, x], axis=1)                    # (B, K-1+T, C)
         out   = mx.conv1d(x_pad, self.weight, padding=0, groups=C)  # (B, T, C)
         return nn.silu(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallel scan for GDN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gdn_parallel_scan(
+    A_all:  mx.array,   # (B, H, T, Dk, Dk)
+    b_all:  mx.array,   # (B, H, T, Dv, Dk)
+    S_init: mx.array,   # (B, H, Dv, Dk)
+) -> mx.array:
+    """
+    Parallel prefix scan for the GDN linear recurrence S_t = S_{t-1} @ A_t + b_t.
+
+    Associative operator:  (A1, b1) ⊕ (A2, b2)  =  (A1 @ A2,  b1 @ A2 + b2)
+
+    Hillis-Steele inclusive scan — O(log T) serial depth, O(T log T) work.
+    Each level is a single batched matmul over the full sequence, so all T
+    positions are updated in parallel on the GPU.
+
+    After the scan, A_scan[:,:,t] and b_scan[:,:,t] encode the cumulative
+    transformation from step 0 to step t:
+        S_t  =  S_init @ A_scan[:,:,t]  +  b_scan[:,:,t]
+
+    Returns S_all: (B, H, T, Dv, Dk)  — state after each of the T tokens.
+    """
+    T = A_all.shape[2]
+
+    # Upcast to float32 — composing log₂(T) levels of float16 matmuls
+    # accumulates rounding error that can overflow to NaN at T=256.
+    # Cast back to original dtype on exit so the rest of the model is unaffected.
+    orig_dtype = A_all.dtype
+    A_scan = A_all.astype(mx.float32)
+    b_scan = b_all.astype(mx.float32)
+    S_f32  = S_init.astype(mx.float32)
+
+    stride = 1
+    while stride < T:
+        n = T - stride
+        # Left operand: positions 0 .. T-stride-1
+        # Right operand: positions stride .. T-1
+        # Combined: left ⊕ right  →  stored at right positions
+        new_right_A = A_scan[:, :, :n] @ A_scan[:, :, stride:]
+        new_right_b = b_scan[:, :, :n] @ A_scan[:, :, stride:] + b_scan[:, :, stride:]
+        A_scan = mx.concatenate([A_scan[:, :, :stride], new_right_A], axis=2)
+        b_scan = mx.concatenate([b_scan[:, :, :stride], new_right_b], axis=2)
+        stride *= 2
+
+    # S_all[t] = S_init @ A_scan[t] + b_scan[t]
+    # S_init[:,:,None] broadcasts (B,H,1,Dv,Dk) over T
+    result = S_f32[:, :, None] @ A_scan + b_scan   # (B, H, T, Dv, Dk)
+    return result.astype(orig_dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,50 +386,28 @@ class GatedDeltaNet(nn.Module):
         beta  = beta.reshape(B, T, H, 1, 1)
         gate  = gate.reshape(B, T, H, D_v)
 
-        # ── Sequential delta-rule recurrence ──────────────────────────────────
-        # Memory budget problem: the outputs list holds T lazy y_t tensors, each
-        # referencing their respective S_t. Even if we eval(S) every CHUNK steps,
-        # the S_i values can't be freed while y_i still holds a lazy reference to
-        # them. For T=256 across 24 GDN layers this keeps ~256 S matrices alive
-        # simultaneously (≈6-7GB).
-        #
-        # Fix: evaluate both S *and* the output chunk at each CHUNK boundary.
-        # After mx.eval(chunk), y_t are concrete and release their S_t references,
-        # capping in-flight state to CHUNK S matrices regardless of T.
-        CHUNK = 32
-        materialized_chunks = []
-        outputs_chunk: list = []
+        # ── Parallel associative scan (O(log T) depth vs O(T) sequential) ───────
+        # S_t = S_{t-1} @ A_t + b_t  where
+        #   A_t = alpha_t * I  -  beta_t * k_t ⊗ k_t^T   (Dk, Dk)
+        #   b_t = beta_t * v_t ⊗ k_t                      (Dv, Dk)
+        # Associative operator: (A1,b1) ⊕ (A2,b2) = (A1@A2, b1@A2+b2)
+        I_k  = mx.eye(D_k, dtype=x.dtype)                            # (Dk, Dk)
+        kk   = k[..., :, None] * k[..., None, :]                     # (B,T,H,Dk,Dk)
+        A_all = (alpha * I_k - beta * kk).transpose(0, 2, 1, 3, 4)  # (B,H,T,Dk,Dk)
 
-        for t in range(T):
-            q_t = q[:, t]              # (B, H, D_k)
-            k_t = k[:, t]
-            v_t = v[:, t]             # (B, H, D_v)
-            a_t = alpha[:, t]         # (B, H, 1, 1)
-            b_t = beta[:, t]
+        vk   = v[..., :, None] * k[..., None, :]                     # (B,T,H,Dv,Dk)
+        b_all = (beta * vk).transpose(0, 2, 1, 3, 4)                 # (B,H,T,Dv,Dk)
 
-            Sk    = mx.einsum("bhvd,bhd->bhv", S, k_t)
-            outer = mx.einsum("bhv,bhd->bhvd", v_t - Sk, k_t)
-            S     = a_t * S + b_t * outer
-            y_t   = mx.einsum("bhvd,bhd->bhv", S, q_t)
-            outputs_chunk.append(y_t)
+        S_all = _gdn_parallel_scan(A_all, b_all, S)                  # (B,H,T,Dv,Dk)
 
-            if (t + 1) % CHUNK == 0:
-                # Materialise S (breaks the S dependency chain for future steps)
-                # and materialise this chunk of outputs (releases S_i references).
-                mx.eval(S)
-                chunk = mx.stack(outputs_chunk, axis=1)   # (B, CHUNK, H, D_v)
-                mx.eval(chunk)
-                materialized_chunks.append(chunk)
-                outputs_chunk = []
+        # y_t = S_t @ q_t
+        q_bhTk = q.transpose(0, 2, 1, 3)                             # (B,H,T,Dk)
+        y = (S_all @ q_bhTk[..., None]).squeeze(-1)                  # (B,H,T,Dv)
+        y = y.transpose(0, 2, 1, 3)                                  # (B,T,H,Dv)
 
-        # Handle any remaining tokens (when T % CHUNK != 0)
-        if outputs_chunk:
-            chunk = mx.stack(outputs_chunk, axis=1)
-            mx.eval(chunk)
-            materialized_chunks.append(chunk)
+        S = S_all[:, :, -1]    # final recurrent state for cache: (B,H,Dv,Dk)
 
         # ── Output: RMSNorm → gate → project ─────────────────────────────────
-        y = mx.concatenate(materialized_chunks, axis=1)       # (B, T, H, D_v)
         y = self.o_norm(y.reshape(B * T * H, D_v)).reshape(B, T, H, D_v)
         y = (y * gate).reshape(B, T, H * D_v)
         out = self.o_proj(y)
@@ -381,11 +415,6 @@ class GatedDeltaNet(nn.Module):
         if cache is not None:
             cache.state = (S, new_conv_ctx)
 
-        # Materialise before returning — frees all intermediate graph nodes
-        # (y_t tensors in outputs, intermediate S values, etc.)
-        # With stop_gradient applied by the caller, the concrete tensor is
-        # treated as a constant in the backward pass.
-        mx.eval(out)
         return out
 
 

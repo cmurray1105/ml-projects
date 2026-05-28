@@ -43,6 +43,7 @@ import json
 import math
 import time
 import random
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -348,12 +349,15 @@ def make_batches(
     batch_size: int = 1,
     shuffle: bool = True,
     dataset_format: str = "alpaca",
+    pad_to_length: Optional[int] = None,
 ):
     """
     Yield (input_ids, labels) as mx.arrays of shape (B, T).
-    Examples within a batch are right-padded with 0 (input) / -100 (labels)
-    to the length of the longest sequence in that batch.
-    Skips examples where the entire response is masked (nothing to learn from).
+    Examples within a batch are right-padded with 0 (input) / -100 (labels).
+
+    pad_to_length: if set, all batches are padded to exactly this length.
+      Required for mx.compile() — fixed shapes prevent graph recompilation
+      every step. Without it, variable T causes recompilation per batch.
     """
     indices = list(range(len(data)))
     if shuffle:
@@ -363,12 +367,7 @@ def make_batches(
     buf_labels: list = []
 
     def _emit(ids_list, labels_list):
-        # Pad to the longest sequence in this batch (not max_length).
-        # Padding to max_length forces GDN to run 64 Python dispatches even for
-        # 20-token examples — slower, not faster. Variable T triggers MLX JIT
-        # recompilation per shape, but that cost is small compared to the saving
-        # from not processing padding tokens in the GDN loop.
-        T = max(len(x) for x in ids_list)
+        T = pad_to_length if pad_to_length else max(len(x) for x in ids_list)
         padded_ids    = [x + [0]    * (T - len(x)) for x in ids_list]
         padded_labels = [x + [-100] * (T - len(x)) for x in labels_list]
         return (mx.array(padded_ids,    dtype=mx.int32),
@@ -468,6 +467,8 @@ def train(
     save_every:       int   = 100,
     log_every:        int   = 1,
     dataset_format:   str   = "alpaca",
+    use_compile:      bool  = False,
+    max_steps:        int   = None,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -476,7 +477,17 @@ def train(
 
     # value_and_grad differentiates w.r.t. model.trainable_parameters()
     # stop_gradient inside LoRALinear ensures only lora_a and lora_b accumulate grads
-    loss_and_grad = nn.value_and_grad(model, loss_fn)
+    loss_value_and_grad = nn.value_and_grad(model, loss_fn)
+
+    # NOTE: mx.compile() is incompatible with this model — the GDN recurrence
+    # calls mx.eval(S) inside the loop to manage memory, which is illegal inside
+    # a compiled function. The --compile flag is accepted but has no effect.
+    if use_compile:
+        print("  ⚠  mx.compile() incompatible with GDN recurrence (mx.eval inside loop)")
+        print("     Running without compile.")
+
+    def loss_and_grad(input_ids, labels):
+        return loss_value_and_grad(model, input_ids, labels)
 
     eff_batch = batch_size * grad_accum_steps
     print(f"\nTraining config:")
@@ -524,8 +535,9 @@ def train(
 
         for input_ids, labels in make_batches(data, tokenizer, max_length,
                                                batch_size=batch_size,
-                                               dataset_format=dataset_format):
-            loss, grads = loss_and_grad(model, input_ids, labels)
+                                               dataset_format=dataset_format,
+                                               pad_to_length=max_length if use_compile else None):
+            loss, grads = loss_and_grad(input_ids, labels)
             mx.eval(loss, grads)   # force evaluation now — prevents graph accumulation across micro-steps
 
             # Free MLX's metal buffer cache between micro-steps.
@@ -539,6 +551,15 @@ def train(
             if micro_step == 0:
                 mem_str = f"  [{_mem()}]" if _mem else ""
                 print(f"  micro-step 0 backward OK — loss={loss_val:.4f}{mem_str}")
+
+            # Skip NaN/Inf steps — check loss first, then grads
+            if not math.isfinite(loss_val):
+                micro_step += 1
+                continue
+            grad_leaves = [v for _, v in tree_flatten(grads)]
+            if any(not mx.isfinite(g).all().item() for g in grad_leaves if isinstance(g, mx.array)):
+                micro_step += 1
+                continue
 
             # Accumulate gradients
             if accum_grads is None:
@@ -554,6 +575,18 @@ def train(
                 # Scale gradients by accumulation steps
                 scale = 1.0 / grad_accum_steps
                 accum_grads = tree_map(lambda g: g * scale, accum_grads)
+
+                # Clip gradient norm (prevents explosion from fp16 scan matmuls)
+                arrays = [v for _, v in tree_flatten(accum_grads) if isinstance(v, mx.array)]
+                global_norm = mx.sqrt(sum(mx.sum(g * g) for g in arrays))
+                mx.eval(global_norm)
+                max_norm = 1.0
+                clip_coef = float(min(1.0, max_norm / (global_norm.item() + 1e-6)))
+                if clip_coef < 1.0:
+                    accum_grads = tree_map(
+                        lambda g: g * clip_coef if isinstance(g, mx.array) else g,
+                        accum_grads
+                    )
 
                 optimizer.update(model, accum_grads)
                 # Only eval trainable (LoRA) params — no need to re-eval frozen weights
@@ -577,6 +610,14 @@ def train(
                 if global_step % save_every == 0:
                     ckpt = output_dir / f"step-{global_step:06d}.npz"
                     save_lora(model, str(ckpt))
+
+                if max_steps is not None and global_step >= max_steps:
+                    print(f"\n  Reached --steps {max_steps}, stopping early.")
+                    # Final save and exit
+                    final_path = output_dir / "final.npz"
+                    save_lora(model, str(final_path))
+                    print(f"Training complete. Final weights → {final_path}")
+                    return
 
     # Final save
     final_path = output_dir / "final.npz"
@@ -645,6 +686,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size",   type=int,   default=1,    help="Examples per forward pass (pad-collated). Start at 2-4.")
     parser.add_argument("--log-every",    type=int,   default=1,    help="Print loss every N optimizer steps (default 1 = every step)")
     parser.add_argument("--max-samples",  type=int,   default=None, help="Cap dataset size (useful for quick tests)")
+    parser.add_argument("--compile",      action="store_true",      help="Use mx.compile() for faster training (requires fixed --max-length padding)")
+    parser.add_argument("--steps",        type=int,   default=None, help="Stop after this many optimizer steps (overrides --epochs)")
     args = parser.parse_args()
 
     mx.set_default_device(mx.gpu)
@@ -784,4 +827,6 @@ if __name__ == "__main__":
         save_every       = args.save_every,
         log_every        = args.log_every,
         dataset_format   = fmt,
+        use_compile      = args.compile,
+        max_steps        = args.steps,
     )
