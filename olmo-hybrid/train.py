@@ -45,6 +45,7 @@ import time
 import random
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import mlx.core as mx
@@ -403,7 +404,7 @@ def loss_fn(model: Model, input_ids: mx.array, labels: mx.array):
     labels:    (1, T) — -100 on prompt positions, real token ids on response
 
     Memory strategy:
-      mx.checkpoint on the full forward pass discards ALL intermediate layer
+      nn.checkpoint on the full forward pass discards ALL intermediate layer
       activations (residuals, MLP gate/up outputs, QKV tensors, etc.) from
       the forward pass.  Only the final logits tensor is kept.  During the
       backward pass, MLX re-runs the full forward to recompute whatever it
@@ -414,14 +415,15 @@ def loss_fn(model: Model, input_ids: mx.array, labels: mx.array):
       With it, peak activation memory is O(1 layer) ≈ 10-20 MB.
 
       Cost: ≈2× forward compute per step.
-    """
-    # Wrap the forward pass in a checkpoint so no activations are retained.
-    # The closure captures `model` by reference — safe because model is alive
-    # for the lifetime of the training loop.
-    def _forward(ids):
-        return model(ids, cache=None)
 
-    logits = mx.checkpoint(_forward)(input_ids)  # (B, T, vocab)
+      IMPORTANT: use nn.checkpoint(model), NOT mx.checkpoint(closure).
+      mx.checkpoint only differentiates w.r.t. the *explicit arguments* of the
+      wrapped function. If the model is captured by closure, its parameters are
+      invisible to checkpoint's VJP and receive ZERO gradient. nn.checkpoint
+      threads model.trainable_parameters() through as explicit inputs, so
+      gradients flow to lora_a AND lora_b correctly.
+    """
+    logits = nn.checkpoint(model)(input_ids, cache=None)  # (B, T, vocab)
 
     # Shift: logits[t] predicts labels[t+1]
     shift_logits = logits[:, :-1, :]       # (B, T-1, vocab)
